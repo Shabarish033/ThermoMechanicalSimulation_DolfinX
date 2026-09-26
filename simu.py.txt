@@ -1,0 +1,1076 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import ufl
+import pyvista as pv
+from mpi4py import MPI
+from dolfinx import mesh, fem
+from dolfinx.fem.petsc import LinearProblem
+from dolfinx.mesh import locate_entities_boundary, meshtags
+
+
+# ============================================================
+# 1. PARAMETERS
+# ============================================================
+
+# ------------------------------------------------------------
+# Geometry
+# ------------------------------------------------------------
+
+L = 1.0                  # Plate length [m]
+W = 0.15                 # Plate width [m]
+thickness = 0.02         # Plate thickness [m]
+
+# Mesh
+nx = 100
+ny = 20
+
+# ------------------------------------------------------------
+# 304 Stainless Steel
+# ------------------------------------------------------------
+
+rho = 8000.0             # Density [kg/m^3]
+k = 16.2                 # Thermal conductivity [W/(m K)]
+cp = 500.0               # Specific heat [J/(kg K)]
+
+E = 193e9                # Young's modulus [Pa]
+nu = 0.29                # Poisson ratio
+alpha = 17.3e-6          # Thermal expansion coefficient [1/K]
+
+# ------------------------------------------------------------
+# Thermal conditions
+# ------------------------------------------------------------
+
+T_initial = 24.0         # Initial temperature [degC]
+T_ambient = 24.0         # Ambient temperature [degC]
+
+h = 10.0                 # Convection coefficient [W/(m^2 K)]
+
+# ------------------------------------------------------------
+# Candle heat source
+# ------------------------------------------------------------
+
+q_candle = 20000.0       # Heat flux [W/m^2]
+candle_height = 0.020    # Heated height = 20 mm
+# Center the candle vertically on the left edge
+candle_y_min = (W - candle_height) / 2.0
+candle_y_max = (W + candle_height) / 2.0
+
+# ------------------------------------------------------------
+# Time integration
+# ------------------------------------------------------------
+
+dt_value = 1.0           # Time step [s]
+total_time = 600.0       # Total simulation time [s]
+
+num_steps = int(total_time / dt_value)
+
+# ============================================================
+# 2. MPI / DOMAIN
+# ============================================================
+
+comm = MPI.COMM_WORLD
+
+rank = comm.rank
+
+# ============================================================
+# 3. CREATE MESH
+# ============================================================
+
+domain = mesh.create_rectangle(
+    comm,
+    [np.array([0.0, 0.0]), np.array([L, W])],
+    [nx, ny],
+    cell_type=mesh.CellType.triangle,
+)
+
+
+tdim = domain.topology.dim
+fdim = tdim - 1
+
+# ============================================================
+# 4. BOUNDARY DEFINITIONS
+# ============================================================
+
+# We deliberately create DISJOINT boundary markers.
+#
+# This is important because the candle region lies on the
+# left edge. We don't want the same facet to simultaneously
+# receive conflicting boundary markers.
+#
+# Marker numbers:
+#
+#   1 = left edge excluding candle
+#   2 = right edge
+#   3 = bottom edge
+#   4 = top edge
+#   5 = candle region
+#
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Candle region
+# ------------------------------------------------------------
+
+facets_candle = locate_entities_boundary(
+    domain,
+    fdim,
+    lambda x: (
+        np.isclose(x[0], 0.0)
+        &
+        (x[1] >= candle_y_min - 1e-12)
+        &
+        (x[1] <= candle_y_max + 1e-12)
+    ),
+)
+
+
+# ------------------------------------------------------------
+# Left edge excluding candle
+# ------------------------------------------------------------
+
+facets_left = locate_entities_boundary(
+    domain,
+    fdim,
+    lambda x: (
+        np.isclose(x[0], 0.0)
+        &
+        (
+            (x[1] < candle_y_min - 1e-12)
+            |
+            (x[1] > candle_y_max + 1e-12)
+        )
+    ),
+)
+
+
+# ------------------------------------------------------------
+# Right edge
+# ------------------------------------------------------------
+
+facets_right = locate_entities_boundary(
+    domain,
+    fdim,
+    lambda x: np.isclose(x[0], L),
+)
+
+
+# ------------------------------------------------------------
+# Bottom edge
+# ------------------------------------------------------------
+
+facets_bottom = locate_entities_boundary(
+    domain,
+    fdim,
+    lambda x: np.isclose(x[1], 0.0),
+)
+
+
+# ------------------------------------------------------------
+# Top edge
+# ------------------------------------------------------------
+
+facets_top = locate_entities_boundary(
+    domain,
+    fdim,
+    lambda x: np.isclose(x[1], W),
+)
+
+
+# ============================================================
+# 5. CREATE FACET TAGS
+# ============================================================
+
+facet_indices = np.concatenate(
+    [
+        facets_left,
+        facets_right,
+        facets_bottom,
+        facets_top,
+        facets_candle,
+    ]
+)
+
+facet_values = np.concatenate(
+    [
+        np.full(len(facets_left), 1, dtype=np.int32),
+        np.full(len(facets_right), 2, dtype=np.int32),
+        np.full(len(facets_bottom), 3, dtype=np.int32),
+        np.full(len(facets_top), 4, dtype=np.int32),
+        np.full(len(facets_candle), 5, dtype=np.int32),
+    ]
+)
+
+
+# Sort facets as required by meshtags
+sort_order = np.argsort(facet_indices)
+
+facet_indices = facet_indices[sort_order]
+facet_values = facet_values[sort_order]
+
+
+facet_tags = meshtags(
+    domain,
+    fdim,
+    facet_indices,
+    facet_values,
+)
+
+# ============================================================
+# 6. MEASURE DEFINITIONS
+# ============================================================
+
+dx = ufl.Measure(
+    "dx",
+    domain=domain,
+)
+
+ds = ufl.Measure(
+    "ds",
+    domain=domain,
+    subdomain_data=facet_tags,
+)
+
+# ============================================================
+# 7. THERMAL FUNCTION SPACE
+# ============================================================
+
+V_T = fem.functionspace(
+    domain,
+    ("Lagrange", 1),
+)
+
+# ============================================================
+# 8. TEMPERATURE FUNCTIONS
+# ============================================================
+
+T = fem.Function(V_T)
+T.name = "Temperature"
+
+T_old = fem.Function(V_T)
+T_old.name = "Temperature_old"
+
+# Initial temperature
+T.x.array[:] = T_initial
+T_old.x.array[:] = T_initial
+
+# ============================================================
+# 9. THERMAL VARIABLES
+# ============================================================
+
+T_trial = ufl.TrialFunction(V_T)
+v_T = ufl.TestFunction(V_T)
+
+# ============================================================
+# 10. THERMAL EQUATION
+# ============================================================
+#
+# rho * cp * dT/dt
+#     - div(k grad(T))
+#     + convection
+#     =
+#     heat flux
+#
+# The thickness is explicitly included for the edge surfaces.
+#
+# For the top and bottom broad surfaces of the physical plate,
+# convection is represented as:
+#
+#     2*h*(T - T_ambient)
+#
+# because there are two surfaces through the thickness.
+#
+# ============================================================
+
+# ------------------------------------------------------------
+# Mass / transient term
+# ------------------------------------------------------------
+
+a_thermal = (
+    rho
+    * cp
+    / dt_value
+    * T_trial
+    * v_T
+    * thickness
+    * dx
+)
+
+
+# ------------------------------------------------------------
+# Thermal conduction
+# ------------------------------------------------------------
+
+a_thermal += (
+    k
+    * ufl.dot(
+        ufl.grad(T_trial),
+        ufl.grad(v_T),
+    )
+    * thickness
+    * dx
+)
+
+
+# ------------------------------------------------------------
+# Edge convection
+#
+# Candle boundary is excluded from this term.
+# ------------------------------------------------------------
+
+a_thermal += (
+    h
+    * T_trial
+    * v_T
+    * thickness
+    * (
+        ds(1)
+        + ds(2)
+        + ds(3)
+        + ds(4)
+    )
+)
+
+
+# ------------------------------------------------------------
+# Top and bottom surfaces of the plate
+# ------------------------------------------------------------
+
+a_thermal += (
+    2.0
+    * h
+    * T_trial
+    * v_T
+    * dx
+)
+
+
+# ============================================================
+# THERMAL RHS
+# ============================================================
+
+L_thermal = (
+    rho
+    * cp
+    / dt_value
+    * T_old
+    * v_T
+    * thickness
+    * dx
+)
+
+
+# ------------------------------------------------------------
+# Ambient convection
+# ------------------------------------------------------------
+
+L_thermal += (
+    h
+    * T_ambient
+    * v_T
+    * thickness
+    * (
+        ds(1)
+        + ds(2)
+        + ds(3)
+        + ds(4)
+    )
+)
+
+
+# ------------------------------------------------------------
+# Ambient temperature on top/bottom surfaces
+# ------------------------------------------------------------
+
+L_thermal += (
+    2.0
+    * h
+    * T_ambient
+    * v_T
+    * dx
+)
+
+
+# ------------------------------------------------------------
+# Candle heat flux
+#
+# q'' [W/m^2]
+#
+# Physical candle area:
+#
+#     thickness * candle_height
+#
+# ------------------------------------------------------------
+
+L_thermal += (
+    q_candle
+    * thickness
+    * v_T
+    * ds(5)
+)
+
+
+# ============================================================
+# 11. THERMAL LINEAR PROBLEM
+# ============================================================
+#
+# IMPORTANT:
+# Your installed DOLFINx requires petsc_options_prefix.
+#
+# ============================================================
+
+thermal_problem = LinearProblem(
+    a_thermal,
+    L_thermal,
+    bcs=[],
+    petsc_options_prefix="thermal_",
+    petsc_options={
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+    },
+)
+
+
+# ============================================================
+# 12. MECHANICAL FUNCTION SPACE
+# ============================================================
+
+V_u = fem.functionspace(
+    domain,
+    (
+        "Lagrange",
+        1,
+        (domain.geometry.dim,),
+    ),
+)
+
+
+# ============================================================
+# 13. MECHANICAL FUNCTIONS
+# ============================================================
+
+u_trial = ufl.TrialFunction(V_u)
+
+v_u = ufl.TestFunction(V_u)
+
+u = fem.Function(V_u)
+u.name = "Displacement"
+
+
+# ============================================================
+# 14. PLANE-STRESS MATERIAL PARAMETERS
+# ============================================================
+
+mu = E / (2.0 * (1.0 + nu))
+
+
+lambda_3d = (
+    E
+    * nu
+    /
+    (
+        (1.0 + nu)
+        * (1.0 - 2.0 * nu)
+    )
+)
+
+
+# Effective Lamé parameter for plane stress
+lambda_ps = (
+    2.0
+    * mu
+    * lambda_3d
+    /
+    (
+        lambda_3d
+        + 2.0 * mu
+    )
+)
+
+
+# ============================================================
+# 15. STRAIN
+# ============================================================
+
+def eps(u):
+    return ufl.sym(ufl.grad(u))
+
+
+# ============================================================
+# 16. ELASTIC STRESS
+# ============================================================
+#
+# IMPORTANT:
+#
+# This depends ONLY on displacement.
+#
+# Therefore it is a valid bilinear form.
+#
+# ============================================================
+
+def sigma_elastic(u):
+
+    return (
+        2.0
+        * mu
+        * eps(u)
+        +
+        lambda_ps
+        * ufl.tr(eps(u))
+        * ufl.Identity(2)
+    )
+
+
+# ============================================================
+# 17. THERMAL STRAIN
+# ============================================================
+
+delta_T = T - T_initial
+
+
+epsilon_thermal = (
+    alpha
+    * delta_T
+    * ufl.Identity(2)
+)
+
+
+# ============================================================
+# 18. THERMAL STRESS
+# ============================================================
+
+sigma_thermal = (
+    2.0
+    * mu
+    * epsilon_thermal
+    +
+    lambda_ps
+    * ufl.tr(epsilon_thermal)
+    * ufl.Identity(2)
+)
+
+
+# ============================================================
+# 19. MECHANICAL WEAK FORM
+# ============================================================
+#
+# Equilibrium:
+#
+#     sigma = sigma_elastic - sigma_thermal
+#
+# Therefore:
+#
+#     Integral(
+#         sigma_elastic : epsilon(v)
+#     ) dx
+#
+#     =
+#
+#     Integral(
+#         sigma_thermal : epsilon(v)
+#     ) dx
+#
+# ============================================================
+
+a_mechanical = (
+    ufl.inner(
+        sigma_elastic(u_trial),
+        eps(v_u),
+    )
+    * dx
+)
+
+
+L_mechanical = (
+    ufl.inner(
+        sigma_thermal,
+        eps(v_u),
+    )
+    * dx
+)
+
+
+# ============================================================
+# 20. FIX LEFT EDGE
+# ============================================================
+#
+# Both displacement components are fixed:
+#
+#     ux = 0
+#     uy = 0
+#
+# ============================================================
+
+left_dofs = fem.locate_dofs_topological(
+    V_u,
+    fdim,
+    facets_left,
+)
+
+
+u_zero = np.array(
+    [0.0, 0.0],
+    dtype=np.float64,
+)
+
+
+bc_mechanical = fem.dirichletbc(
+    u_zero,
+    left_dofs,
+    V_u,
+)
+
+
+# ============================================================
+# 21. MECHANICAL LINEAR PROBLEM
+# ============================================================
+
+mechanical_problem = LinearProblem(
+    a_mechanical,
+    L_mechanical,
+    bcs=[bc_mechanical],
+    petsc_options_prefix="mechanical_",
+    petsc_options={
+        "ksp_type": "preonly",
+        "pc_type": "lu",
+    },
+)
+
+
+# ============================================================
+# 22. STORAGE FOR RESULTS
+# ============================================================
+
+time_values = []
+
+max_temperature_values = []
+min_temperature_values = []
+
+max_displacement_values = []
+
+
+# ============================================================
+# 23. TIME LOOP
+# ============================================================
+
+if rank == 0:
+
+    print()
+    print("=" * 70)
+    print("2D TRANSIENT THERMO-MECHANICAL SIMULATION")
+    print("=" * 70)
+
+    print(f"Plate length       : {L} m")
+    print(f"Plate width        : {W} m")
+    print(f"Plate thickness    : {thickness} m")
+    print(f"Material           : 304 Stainless Steel")
+    print(f"Initial temperature: {T_initial} degC")
+    print(f"Candle heat flux   : {q_candle} W/m^2")
+    print(f"Candle height      : {candle_height} m")
+    print(f"Convection         : {h} W/(m^2 K)")
+    print(f"Time step          : {dt_value} s")
+    print(f"Total time         : {total_time} s")
+    print("=" * 70)
+    print()
+
+
+for step in range(1, num_steps + 1):
+
+    current_time = step * dt_value
+
+
+    # ========================================================
+    # THERMAL SOLUTION
+    # ========================================================
+
+    T_new = thermal_problem.solve()
+
+
+    # Copy solution into T
+    T.x.array[:] = T_new.x.array
+
+
+    # ========================================================
+    # MECHANICAL SOLUTION
+    # ========================================================
+
+    u_new = mechanical_problem.solve()
+
+
+    # Copy solution
+    u.x.array[:] = u_new.x.array
+
+
+    # ========================================================
+    # STORE RESULTS
+    # ========================================================
+
+    local_T_max = np.max(T.x.array)
+    local_T_min = np.min(T.x.array)
+
+
+    # Displacement vector has x and y components
+    displacement_array = u.x.array.reshape(
+        (-1, 2)
+    )
+
+
+    displacement_magnitude = np.sqrt(
+        displacement_array[:, 0] ** 2
+        +
+        displacement_array[:, 1] ** 2
+    )
+
+
+    local_u_max = np.max(
+        displacement_magnitude
+    )
+
+
+    # For serial execution this is sufficient.
+    # MPI reduction makes the quantities globally correct.
+    global_T_max = comm.allreduce(
+        local_T_max,
+        op=MPI.MAX,
+    )
+
+    global_T_min = comm.allreduce(
+        local_T_min,
+        op=MPI.MIN,
+    )
+
+    global_u_max = comm.allreduce(
+        local_u_max,
+        op=MPI.MAX,
+    )
+
+
+    time_values.append(current_time)
+
+    max_temperature_values.append(
+        global_T_max
+    )
+
+    min_temperature_values.append(
+        global_T_min
+    )
+
+    max_displacement_values.append(
+        global_u_max
+    )
+
+
+    # ========================================================
+    # UPDATE OLD TEMPERATURE
+    # ========================================================
+
+    T_old.x.array[:] = T.x.array
+
+
+    # ========================================================
+    # PRINT PROGRESS
+    # ========================================================
+
+    if rank == 0:
+
+        print(
+            f"Time = {current_time:6.1f} s | "
+            f"Tmin = {global_T_min:8.2f} °C | "
+            f"Tmax = {global_T_max:8.2f} °C | "
+            f"Max displacement = "
+            f"{global_u_max * 1000.0:10.4f} mm"
+        )
+
+
+# ============================================================
+# 24. FINAL RESULTS
+# ============================================================
+
+if rank == 0:
+
+    print()
+    print("=" * 70)
+    print("SIMULATION FINISHED")
+    print("=" * 70)
+
+    print(
+        f"Final minimum temperature : "
+        f"{min_temperature_values[-1]:.2f} °C"
+    )
+
+    print(
+        f"Final maximum temperature : "
+        f"{max_temperature_values[-1]:.2f} °C"
+    )
+
+    print(
+        f"Final maximum displacement: "
+        f"{max_displacement_values[-1] * 1000.0:.4f} mm"
+    )
+
+    print("=" * 70)
+
+
+# ============================================================
+# 25. MATPLOTLIB:
+#     MAXIMUM TEMPERATURE VS TIME
+# ============================================================
+
+if rank == 0:
+
+    plt.figure(
+        figsize=(8, 5)
+    )
+
+    plt.plot(
+        time_values,
+        max_temperature_values,
+        label="Maximum temperature",
+    )
+
+    plt.plot(
+        time_values,
+        min_temperature_values,
+        label="Minimum temperature",
+    )
+
+    plt.xlabel("Time [s]")
+
+    plt.ylabel("Temperature [°C]")
+
+    plt.title(
+        "Temperature Evolution"
+    )
+
+    plt.grid(True)
+
+    plt.legend()
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 26. MATPLOTLIB:
+#     MAXIMUM DISPLACEMENT VS TIME
+# ============================================================
+
+if rank == 0:
+
+    plt.figure(
+        figsize=(8, 5)
+    )
+
+    plt.plot(
+        time_values,
+        np.array(max_displacement_values) * 1000.0,
+    )
+
+    plt.xlabel("Time [s]")
+
+    plt.ylabel(
+        "Maximum displacement [mm]"
+    )
+
+    plt.title(
+        "Thermal Displacement Evolution"
+    )
+
+    plt.grid(True)
+
+    plt.tight_layout()
+
+    plt.show()
+
+
+# ============================================================
+# 27. PYVISTA FINAL TEMPERATURE FIELD
+# ============================================================
+#
+# This visualization is intended for SERIAL execution:
+#
+#     python Simu.py
+#
+# rather than:
+#
+#     mpirun -n 4 python Simu.py
+#
+# ============================================================
+
+if rank == 0:
+
+    # --------------------------------------------------------
+    # Extract mesh geometry
+    # --------------------------------------------------------
+
+    geometry = domain.geometry.x
+
+
+    # Ensure 3D coordinates for VTK
+    points = np.column_stack(
+        [
+            geometry[:, 0],
+            geometry[:, 1],
+            np.zeros(len(geometry)),
+        ]
+    )
+
+
+    # --------------------------------------------------------
+    # Extract topology
+    # --------------------------------------------------------
+
+    domain.topology.create_connectivity(
+        tdim,
+        0,
+    )
+
+
+    connectivity = domain.topology.connectivity(
+        tdim,
+        0,
+    )
+
+
+    cells = connectivity.array
+
+
+    # Triangle connectivity
+    num_cells = len(cells) // 3
+
+
+    vtk_cells = np.hstack(
+        [
+            np.full(
+                num_cells,
+                3,
+                dtype=np.int64,
+            ),
+            cells.astype(np.int64),
+        ]
+    )
+
+
+    cell_types = np.full(
+        num_cells,
+        pv.CellType.TRIANGLE,
+        dtype=np.uint8,
+    )
+
+
+    # --------------------------------------------------------
+    # Create PyVista grid
+    # --------------------------------------------------------
+
+    grid = pv.UnstructuredGrid(
+        vtk_cells,
+        cell_types,
+        points,
+    )
+
+
+    # --------------------------------------------------------
+    # Temperature field
+    # --------------------------------------------------------
+
+    temperature_values = T.x.array.copy()
+
+
+    grid.point_data[
+        "Temperature"
+    ] = temperature_values
+
+
+    # --------------------------------------------------------
+    # Displacement field
+    # --------------------------------------------------------
+
+    displacement = (
+        u.x.array
+        .reshape((-1, 2))
+    )
+
+
+    displacement_3d = np.column_stack(
+        [
+            displacement[:, 0],
+            displacement[:, 1],
+            np.zeros(len(displacement)),
+        ]
+    )
+
+
+    grid.point_data[
+        "Displacement"
+    ] = displacement_3d
+
+
+    # Magnitude
+    displacement_magnitude = np.sqrt(
+        displacement[:, 0] ** 2
+        +
+        displacement[:, 1] ** 2
+    )
+
+
+    grid.point_data[
+        "Displacement Magnitude"
+    ] = (
+        displacement_magnitude * 1000.0
+    )
+
+
+    # ========================================================
+    # DEFORMED SHAPE
+    # ========================================================
+
+    # Exaggeration factor so that the thermal deformation
+    # can be visually observed.
+    deformation_scale = 100.0
+
+
+    deformed_points = (
+        points
+        +
+        deformation_scale
+        * displacement_3d
+    )
+
+
+    deformed_grid = grid.copy()
+
+    deformed_grid.points = deformed_points
+
+
+    # ========================================================
+    # PYVISTA PLOT
+    # ========================================================
+
+    plotter = pv.Plotter()
+
+    plotter.add_mesh(
+        deformed_grid,
+        scalars="Temperature",
+        show_edges=True,
+        scalar_bar_args={
+            "title": "Temperature [°C]"
+        },
+    )
+
+
+    plotter.add_text(
+        "Final temperature field\n"
+        "Deformation exaggerated 100x",
+        position="upper_left",
+        font_size=12,
+    )
+
+
+    plotter.view_xy()
+
+    plotter.show()
+
+# ============================================================
+# END OF PROGRAM
+# ============================================================
